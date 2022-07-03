@@ -1,0 +1,602 @@
+# VERSIONS:
+# 2021/07/28 - Atos Windows added - elseif ($PatchToday -and $PatchYesterday) # 2 - Patching started yesterday and it continue today
+#
+workflow Check-VmSchedule {
+    <#
+	.SYNOPSIS
+		Discovers all VM's in all resource groups inside a given subscription and evaluates the existence of certain tags to automatically start/stop the virtual machines 
+	.DESCRIPTION
+		Discovers all VM's in all resource groups inside a given subscription and evaluates the existence of certain tags to automatically start/stop the virtual machines
+	.PARAMETER SubscriptioName
+		Name of Azure subscription where resource groups and resources are located to be evaluated
+	.PARAMETER TimeZoneID
+		The timezone to use. Default: Romance Standard Time.
+	.PARAMETER AutomationConnectionName
+		The name of the automation connection. This will be 'AzurerunAsConnection' in 90% of the cases, but can be modified.
+	.NOTE
+        Documentation can be found on the Azure CC portal 
+	.DISCLAIMER
+		This script was created by Krzysztof Gerus for a Hosts to avoid power off during monthly patching.
+	#>
+
+# ----------------------
+# | RUNBOOK PARAMETERS | 
+# ----------------------
+
+	[cmdletBinding()]
+	Param
+	(
+		[Parameter(Mandatory=$true,HelpMessage="Enter the value for SubscriptionName. This value is mandatory")][string]$SubscriptionName,
+        [Parameter(Mandatory=$false,HelpMessage="Enter the value for TimeZoneId. Default value is Romance Standard Time")][string]$TimeZoneId = "Romance Standard Time",
+        [Parameter(Mandatory=$false,HelpMessage="Enter the value for AutomationConnectionName. Default valie is AzureRunAsConnection")][string]$AutomationConnectionName = "AzureRunAsConnection",
+        [Parameter(Mandatory=$false,HelpMessage="Enter the value for WhatIf. Values can be either true or false")][bool]$WhatIf = $false
+	)
+
+# ----------------------
+# |  CODE PARAMETERS   | 
+# ----------------------
+    
+    $VmList = @()
+    $VmsToStop = @()
+	$VmsToStart = @()
+    $VerbosePreference = "Continue"
+
+# ----------------------
+# |    FUNCTIONS       | 
+# ----------------------
+
+function CheckPowerState {
+    param (
+        $Vm,
+        $PsVersion
+    )
+
+    if ($null -eq $Vm) {
+        Write-Error "VM Provided to function CheckPowerState not found"                                                                                                #ERROR OUTPUT
+    }
+    $VmDetails = Get-AzureRmVM -ResourceGroupName $Vm.ResourceGroupName -Name $Vm.Name -Status
+    $VmDetailsJson = ConvertTo-Json $VmDetails -depth 100
+    $VmDetailsConverted = ConvertFrom-Json $VmDetailsJson 
+                    
+    if ([Version]$PsVersion -ge [Version]"1.3") {
+        $VmStatusCode = $VmDetailsConverted.Statuses[1].code
+    }
+    else {
+        $VmStatuses = ConvertFrom-Json $VmDetailsConverted.StatusesText
+        $VmStatusCode = $vmStatuses[1].code
+    }
+    return $VmStatusCode
+}
+
+function CheckWeeklySchedule {
+    param (
+        $Vm,
+        $CurrentHour,
+        $CurrentWeekDay,
+        $PatchStatus
+    )
+
+    $output = ""
+    $action = ""
+    $TimeToStart = ""
+    $TimeToStop = ""
+    $AlldaySchedule = ""
+    $ScheduleDefault = ""
+
+    try {
+        if ($Vm.weeklySchedule.type -eq "automatic") { # Check is type is automatic
+            if($Vm.weeklySchedule.($CurrentWeekDay)) {
+                if (($Vm.weeklySchedule.($CurrentWeekDay).S) -and ($Vm.weeklySchedule.($CurrentWeekDay).E)) {
+                    $TimeToStart = [int]::Parse($Vm.weeklySchedule.($CurrentWeekDay).S)
+                    $TimeToStop = [int]::Parse($Vm.weeklySchedule.($CurrentWeekDay).E)
+                    $output += "$($Vm.Name): CheckWeeklySchedule: automatic: Start time for day $CurrentWeekDay is: $TimeToStart.`n"                           #INFORMATION OUTPUT
+                    $output += "$($Vm.Name): CheckWeeklySchedule: automatic: Stop time for day $CurrentWeekDay is: $TimeToStop.`n"                             #INFORMATION OUTPUT
+                }
+                elseif ($Vm.weeklySchedule.($CurrentWeekDay).S) {
+                    $TimeToStart = [int]::Parse($Vm.weeklySchedule.($CurrentWeekDay).S)
+                    $output += "$($Vm.Name): CheckWeeklySchedule: automatic: Start time for day $CurrentWeekDay is: $TimeToStart.`n"                           #INFORMATION OUTPUT
+                }
+                elseif ($Vm.weeklySchedule.($CurrentWeekDay).E) {
+                    $TimeToStop = [int]::Parse($Vm.weeklySchedule.($CurrentWeekDay).E)
+                    $output += "$($Vm.Name): CheckWeeklySchedule: automatic: Stop time for day $CurrentWeekDay is: $TimeToStop.`n"                           #INFORMATION OUTPUT
+                }
+                else {
+                    $AlldaySchedule = $Vm.weeklySchedule.($CurrentWeekDay)
+                    $output += "$($Vm.Name): CheckWeeklySchedule: automatic: Allday event for day $CurrentWeekDay is: $AlldaySchedule.`n"                      #INFORMATION OUTPUT
+                }
+            }
+            else {
+                $output += "$($Vm.Name): CheckWeeklySchedule: No entry found for day $CurrentWeekDay.`n"                                                            #INFORMATION OUTPUT
+                $action = "NoEntry" 
+            }
+        }
+        elseif ($Vm.weeklySchedule.type -eq "manual") { # Check is type is manual
+            $ScheduleDefault = $Vm.weeklySchedule.default
+            $output += "$($Vm.Name): CheckWeeklySchedule: manual: default schedule is: $ScheduleDefault.`n"                                                 #INFORMATION OUTPUT
+        }
+        else {
+            $output += "$($Vm.Name): CheckWeeklySchedule: Wrong PatchSchedule tags. Check in Azure .`n"                                                     #INFORMATION OUTPUT
+        }
+    }
+    catch {
+        $output += "$($Vm.Name): CheckWeeklySchedule: Error while getting schedule values for day $CurrentWeekDay.`n"                                                #ERROR OUTPUT
+        $action = "NoEntry" 
+    }
+        
+    if ($TimeToStart -and $TimeToStop) {
+        if ($TimeToStart -lt 24 -and $TimeToStop -lt 24 -and $TimeToStart -ge 0 -and $TimeToStop -ge 0) {
+            if ($TimeToStart -lt $TimeToStop) {
+                if ($CurrentHour -ge $TimeToStart -and $CurrentHour -lt $TimeToStop) {
+                    $output += "$($Vm.Name): CheckWeeklySchedule: VM added to start-list`n"                                                             #INFORMATION OUTPUT
+                    $action = "Start"
+                }
+                else {
+                    $output += "$($Vm.Name): CheckWeeklySchedule: VM will be stopped`n"                                                             #INFORMATION OUTPUT
+                    $action = "Stop"
+                    }
+                }
+            else {
+                $output += "$($Vm.Name): CheckWeeklySchedule: start time higher than the end time. Please correct this.`n"                              #INFORMATION OUTPUT
+                $action = "NoEntry"
+            }
+        }
+        else {
+            $output += "$($Vm.Name): CheckWeeklySchedule: start or stop time is incorrect. Please correct this..`n"                                     #INFORMATION OUTPUT
+            $action = "NoEntry"
+        }
+    }
+    elseif($TimeToStart -and !$TimeToStop) {
+        if($TimeToStart -le $CurrentHour) {
+            $output += "$($Vm.Name): CheckWeeklySchedule: VM added to start-list`n"                                                                               #INFORMATION OUTPUT
+            $action = "Start"
+        }
+    }
+    elseif(!$TimeToStart -and $TimeToStop) {
+        if($TimeToStop -le $CurrentHour) {
+            $output += "$($Vm.Name): CheckWeeklySchedule: VM added to stop-list`n"                                                                               #INFORMATION OUTPUT
+            $action = "Stop"
+        }
+    }
+    elseif ($AlldaySchedule) {
+        if ($AlldaySchedule -eq "ON") {
+            $output += "$($Vm.Name): CheckWeeklySchedule: VM will run the entire day.`n"                                       #INFORMATION OUTPUT
+            $output += "$($Vm.Name): CheckWeeklySchedule: VM added to start-list`n"                                            #INFORMATION OUTPUT
+            $action = "Start"
+        }
+        elseif ($AlldaySchedule -eq "OFF") {
+            $output += "$($Vm.Name): CheckWeeklySchedule: VM is turned off the entire day.`n"                                #INFORMATION OUTPUT
+            $output += "$($Vm.Name): CheckWeeklySchedule: VM added to stop-list`n"                                        #INFORMATION OUTPUT
+            $action = "Stop"
+        }
+        else {
+            $output += "$($Vm.Name): CheckWeeklySchedule: Invalid 'AlldaySchedule' value.`n"                                   #INFORMATION OUTPUT
+            $action = "NoEntry"
+        }
+    }
+    elseif ($ScheduleDefault) {
+        if ($PatchStatus -eq "none") {
+            $output += "$($Vm.Name): CheckWeeklySchedule: PatchSchedule is set on manual, don't touch.`n"                       #INFORMATION OUTPUT
+            $action = "KeepState"
+        }
+        else {
+            if ($ScheduleDefault -eq "ON") {
+                $output += "$($Vm.Name): CheckWeeklySchedule: VM added to start-list`n"                                                                       #INFORMATION OUTPUT
+                $action = "Start"
+            }
+            elseif ($ScheduleDefault -eq "OFF") {
+                $action = "Stop"
+            }
+            else {
+                $output += "$($Vm.Name): CheckWeeklySchedule: Invalid 'ScheduleDefault' value.`n"                                     #INFORMATION OUTPUT
+                $action = "NoEntry"
+            }
+        }
+    }
+    else {
+        $output += "$($Vm.Name): CheckWeeklySchedule: No correct tags found for day $CurrentWeekDay.`n"                                                    #INFORMATION OUTPUT
+        $action = "NoEntry"  
+    }  
+
+    $outputs = @{
+        "PowerAction" = $action
+        "logs" = $output
+    }
+    return $outputs
+}
+
+# ----------------------
+# |    CODE BODY       | 
+# ----------------------
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Get powershell modules and their version information
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+$AzurePsModule = Get-Module -ListAvailable -Name Azure
+$AzureComputePsModule = Get-Module -ListAvailable -Name AzureRm.Compute
+$AzureRmPsVersion = $AzurePsModule.Version
+Write-Verbose "PowerShell version: $($PSVersionTable.PSVersion.ToString())"                                                                                             #DEBUG OUTPUT
+Write-Verbose "Azure RM Powershell Module version $($AzurePsModule.Version.ToString())"                                                                                 #DEBUG OUTPUT
+Write-Verbose "Azure RM Compute Module version: $($AzureComputePsModule.Version.ToString())"                                                                            #DEBUG OUTPUT
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# DECOMMISSIONED, as AA is using Managed Identity (07.10.2021) Authenticating using the service principal used by the automation account. Throws a custom error if it fails to retreive the service principal
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+try {
+    $ServicePrincipalConnection = Get-AutomationConnection -Name $AutomationConnectionName         
+    Add-AzureRmAccount -ServicePrincipal -TenantId $servicePrincipalConnection.TenantId -ApplicationId $servicePrincipalConnection.ApplicationId -CertificateThumbprint $servicePrincipalConnection.CertificateThumbprint 
+}
+catch {
+    if (!$servicePrincipalConnection) 
+    {
+        Write-Error "Connection $AutomationConnectionName not found." -ErrorAction Stop
+    } 
+    else 
+    {
+        Write-Error -Message $_.Exception -ErrorAction Stop
+    }
+}
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Authenticating using the service principal used by the automation account. Throws a custom error if it fails to retreive the service principal
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# try{
+#     $conn = Connect-AzAccount -Identity
+# }
+# catch{
+#     Write-Error -Message "Exception occured: $_.Exception" -ErrorAction Stop
+# }
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# After logging in, select the subscription to use, as more than one might be coupled to the AAD. If the subscriptionName provided is not find, provide feedback.
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+try
+{
+    Select-AzureRmSubscription -SubscriptionName $SubscriptionName -ErrorAction Stop
+}	
+catch
+{
+    Write-Error "Subscription with name '$SubscriptionName' was not found." -ErrorAction Stop                                                                          #ERROR OUTPUT
+}
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# First, we count the resource groups and tell the admin how much resoruce groups were discovered using the SP's credentials. 
+# The command is always converted to an array because when only one object is found, the .count property would not work as the $ResourceGroups parameter would not be an array.
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+$ResourceGroups = @(Get-AzureRmResourceGroup)
+Write-Output "Found $($ResourceGroups.count) resource groups."
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Iterate all resource groups and count the number of VMs in them. Check if these VM's contian a patchSchedule, bypassSchedule or weeklySchedule tag
+# If one of the tags is present, add the VM to a list to be evaluated later on
+# The command is always converted to an array because when only one object is found, the .count property would not work as the $Vms parameter would not be an array.
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+foreach -parallel ($ResourceGroup in $ResourceGroups) {
+    $Vms = @(Get-AzureRmVM -ResourceGroupName $ResourceGroup.ResourceGroupName)
+    Write-Output "Found $($Vms.Count) virtual machines in resource group $($ResourceGroup.ResourceGroupName)."                                                    #INFORMATION OUTPUT
+    
+    foreach ($Vm in $Vms) {
+        Write-Verbose "$($Vm.Name): Evaluating tags"                                                                                                                   #DEBUG OUTPUT
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # Set tag parameters to $false by default
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		
+        $Bypass = $false
+        $VmTags = $Vm.Tags
+
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # In a workflow, we cannot use .ContainsKey, thus we have to wrap our code in an inline block. 
+        # We check if a bypass schedule is configured and check the value. If it is true, we skip further evaluation
+        # If false, we check if a patching- and/or weekly schedule is configured and place this in variables to use in our logic later on.
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        $BypassTag = "bypassSchedule"
+        $BypassConfigured = InlineScript {
+            $InlineTags = $Using:VmTags 
+            $InlineTags.ContainsKey($Using:BypassTag)
+        }
+        
+        if($BypassConfigured) {
+            if ($VmTags.Item($BypassTag) -eq "true") {
+                $Bypass = $true
+            } 
+            else {
+                $Bypass = $false
+                Write-Verbose "$($Vm.Name): bypassSchedule tag is configured but has value '$($VmTags.Item($BypassTag))'. The schedules will not be bypassed."         #DEBUG OUTPUT
+            }
+        }
+        else {
+            $Bypass = $false
+            Write-Verbose "$($Vm.Name): No bypassSchedule tag present"                                                                                                 #DEBUG OUTPUT
+        }
+
+
+        if ($Bypass) {
+            Write-Output "$($Vm.Name): bypassSchedule set to true. No further evaluation needed."                                                                              #DEBUG OUTPUT
+            $WeeklySchedule = ""
+            $PatchSchedule = ""
+        }
+        else {
+            #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            # No bypass -> Check for patchSchedule and weeklySchedule tags
+            #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            $PatchScheduleTag = "patchSchedule"
+            $PatchConfigured = InlineScript{
+                $InlineTags = $Using:VmTags 
+                $InlineTags.ContainsKey($Using:PatchScheduleTag)
+            }
+
+            $WeeklyScheduleTag = "weeklySchedule"
+            $WeeklyConfigured = InlineScript{
+                $InlineTags = $Using:VmTags 
+                $InlineTags.ContainsKey($Using:WeeklyScheduleTag)
+            }
+
+            if ($PatchConfigured) {
+                $PatchScheduleId = $VmTags.Item($PatchScheduleTag)
+                if ($PatchScheduleId -eq "none") {
+                    $PatchSchedule = ""
+                    Write-Verbose "Patch schedule set to 'none' for $($Vm.name)"
+                }
+                else {
+                    try {
+                        $PatchSchedule = ConvertFrom-JSON((Get-AutomationVariable -Name $PatchScheduleId).ToString())
+                        Write-Verbose "Patch schedule found for $($Vm.name): $PatchSchedule"                                                                               #DEBUG OUTPUT
+                    }
+                    catch {
+                        $PatchSchedule = ""
+                        Write-Error "$($Vm.Name): $PatchScheduleTag is not defined in a valid JSON format"                                                                              #ERROR OUTPUT
+                    }
+                }
+            }
+            else {
+                $PatchSchedule = ""
+                Write-Verbose "No patch schedule found for $($Vm.name)"                                                                                                #DEBUG OUTPUT
+            }
+
+            if ($WeeklyConfigured) {
+                try {
+                    $WeeklySchedule = ConvertFrom-JSON($VmTags.Item($WeeklyScheduleTag))
+                    Write-Verbose "Weekly schedule found for $($Vm.name): $WeeklySchedule"                                                                             #DEBUG OUTPUT
+                }
+                catch {
+                    $WeeklySchedule = ""
+                    Write-Error "$($Vm.Name): $WeeklyScheduleTag is not defined in a valid JSON format"                                                                            #ERROR OUTPUT
+                }
+            }
+            else {
+                $WeeklySchedule = ""
+                Write-Verbose "No weekly schedule found for $($Vm.name)"                                                                                               #DEBUG OUTPUT
+            }
+        }
+
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # If a weekly schedule or a patch schedule was found, add the VM to the list of VM's to be evaluated
+        # We need to use $WORKFLOW: to modify a parameter that exists outside of the scope of a paralell() or sequence() block, like 'foreach -parallel'
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        if (($WeeklySchedule -ne "") -or ($PatchSchedule -ne "")) {
+            $vmObj = New-Object -TypeName PSObject -Property @{"Name"=$Vm.Name;"ResourceGroupName"=$Vm.ResourceGroupName;"patchSchedule"=$PatchSchedule;"weeklySchedule"=$WeeklySchedule}
+            $WORKFLOW:vmList += $vmObj
+            Write-Output "$($Vm.name): Valid Patch and/or weekly schedule found. Adding $($Vm.name) to the evaluation list."                                           #INFORMATION OUTPUT
+        }
+    }
+}
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Get all required date/time parameters for start/stop evaluation
+# We convert the UTC time to the timezone specified as a runbook parameter
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+try {
+    $TimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
+}
+catch {
+    Write-Warning "Time zone id '$TimeZoneId' is not a valid value. Reverting to Romance Standard Time"                                                                #WARNING OUTPUT
+    $TimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Romance Standard Time")
+}
+
+$UtcTime = [datetime]::UtcNow
+$TimeZoneCurrentTime = [System.TimeZoneInfo]::ConvertTimeFromUtc($UtcTime, $TimeZone)
+#$TimeZoneCurrentTime = $TimeZoneCurrentTime.AddDays(-25)
+$Now = $TimeZoneCurrentTime
+$CurrentMonth = $TimeZoneCurrentTime.Month
+$CurrentDay = $TimeZoneCurrentTime.Day
+$Yesterday = $TimeZoneCurrentTime.AddDays(-1).Day
+$YesterMonth = $TimeZoneCurrentTime.AddDays(-1).Month
+$CurrentHour  =$TimeZoneCurrentTime.Hour
+$CurrentWeekDay = $TimeZoneCurrentTime.DayOfWeek.value__
+
+write-Output "Ammount of VM's that will be evaluated now: $($vmList.Count). Current hour is $CurrentHour."                                                             #INFORMATION OUTPUT
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Iterate all VM's which have a WeeklySchedule or PatchSchedule
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   
+foreach -parallel ($Vm in $VmList) {
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # Check if a patchSchedule exists for this VM  
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    if($Vm.patchSchedule) {
+        Write-Output "$($Vm.name): Patch schedule exists. Evaluating it now."                                                                                        #DEBUG OUTPUT
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # Use a try-catch statement to check the entry for the current month matches the current day. The catch is used to handle the case where there is no entry for this month
+        #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        try {
+            #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            # Check if the patch schedule for this month matches today.
+            # If today is a patch day -> Set $PatchToday to $true, else set it to $false. If an error is thrown, the catch block also sets it to $false
+            # Also check if yesterday was also a patchday => do nothing
+            #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            $PatchStartHour = 00        
+
+            # Check if today is Patchday
+            if ($Vm.patchSchedule.($CurrentMonth) -contains $CurrentDay) {
+                $PatchToday = $true
+                Write-Verbose "$($Vm.name): Today is a patchday"                                                                                                #DEBUG OUTPUT
+            }
+            else {
+                $PatchToday = $false
+                Write-Verbose "$($Vm.name): Today is NOT a patchday"                                                                                            #DEBUG OUTPUT
+            }
+
+            if ($YesterMonth -eq $CurrentMonth) { # Check if yesterday was Patchday in current month
+                if ($Vm.patchSchedule.($CurrentMonth) -contains $Yesterday) {
+                    $PatchYesterday = $true
+                    Write-Verbose "$($Vm.name): Yesterday was a patchday"                                                                                       #DEBUG OUTPUT
+                }
+                else {
+                    $PatchYesterday = $false
+                    Write-Verbose "$($Vm.name): Yesterday was NOT a patchday"                                                                                   #DEBUG OUTPUT
+                }
+            }
+            else { # Check if yesterday was Patchday in previous month
+                if ($Vm.patchSchedule.($YesterMonth) -contains $Yesterday) {
+                    $PatchYesterday = $true
+                    Write-Verbose "$($Vm.name): Yesterday was a patchday"                                                                                       #DEBUG OUTPUT
+                }
+                else {
+                    $PatchYesterday = $false
+                    Write-Verbose "$($Vm.name): Yesterday was NOT a patchday"                                                                                   #DEBUG OUTPUT
+                }
+            }
+
+            #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            # Check if patching is happening right now, using the information we have.
+            #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            
+            if ($PatchToday -and !$PatchYesterday -and ($PatchStartHour -eq $Now.Hour)) { # 1 - Patching starts today, it is 00 hour & patching did not occured yesterday
+                $PatchStatus = "Start"
+            }
+            elseif ($PatchToday -and ($PatchStartHour -ne $Now.Hour)) { # 2 - Patching starts today & it's after 00 hour => do nothing
+                $PatchStatus = "InProgress"
+            }
+            elseif ($PatchToday -and $PatchYesterday) { # 2 - Patching started yesterday and it continue today
+                $PatchStatus = "InProgress"
+            }
+            elseif (!$PatchToday -and ($PatchStartHour -eq $Now.Hour)) { # 3 - Patching is not scheduled for today & it is 00 hour => fallback to weekly schedule
+                $PatchStatus = "End"
+            }
+            else { # 4 - All other options => no patch status => fallback to weekly schedule (only automatic type)
+                $PatchStatus = "None"
+            }
+        }
+
+        catch {
+            $PatchStatus = "None"
+            Write-Output "$($Vm.name): No patch day seems to be configured for this month or the Patch Schedule variable is not valid."                              #DEBUG OUTPUT
+        }
+    }
+
+    else {
+        $PatchStatus = "None"
+        Write-Output "$($Vm.name): No patch schedule configured."                                                                                                    #DEBUG OUTPUT
+    }
+        
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # Check the current power state
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    $VmPowerState = CheckPowerState -Vm $Vm -PsVersion $AzureRmPsVersion
+    Write-Output "$($Vm.Name): Current power state is $VmPowerState. PatchStatus is '$PatchStatus'"     
+
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # 1 - If $PatchStatus = Start, add the VM to the start list, or keep current state if correct
+    # 2 - If $PatchStatus = InProgress, ignore the weekly schedule, keep current state
+    # 3 - If $PatchStatus = End, check the weekly schedule
+    # 4 - If $PatchStatus = None, check the weekly schedule, but ignore the manual type
+    # NOTE: switch statements don't work in a PowerShell Workflow. Using elseif instead
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    if($PatchStatus -eq "Start") {                                    #1
+        if($VmPowerState -eq "PowerState/starting" -or $VmPowerState -eq "PowerState/running") {
+            $VmPowerAction = "KeepState"
+            Write-Output "$($Vm.Name): Patching about to start: VM already running or starting"                                                                       #INFORMATION OUTPUT
+        }
+        else {
+            $VmPowerAction = "Start"
+            Write-Output "$($Vm.Name): Patching about to start: VM not running yet"                                                                                   #INFORMATION OUTPUT
+        }
+    }
+    elseif($PatchStatus -eq "InProgress") {                           #2
+        #if there is a patching day and VM is not running, we need to start it.
+        if($VmPowerState -eq "PowerState/deallocated" -or $VmPowerState -eq "PowerState/deallocating")
+        {
+            $VmPowerAction = "Start"
+            Write-Output "$($Vm.Name): Patching in progress, but VM not running yet."
+        }
+        else
+        {
+            $VmPowerAction = "KeepState"
+        Write-Output "$($Vm.Name): Patching in progress. Power state will not be changed."                                                                            #INFORMATION OUTPUT
+        }
+        
+    }
+    elseif($PatchStatus -eq "End") {                                  #3
+        $Temp = CheckWeeklySchedule $Vm $CurrentHour $CurrentWeekDay $PatchStatus
+        $VmPowerAction = $Temp.PowerAction
+     
+    }
+    elseif ($PatchStatus -eq "None") {                                #4
+        if ($Vm.weeklySchedule) {
+            $Temp = CheckWeeklySchedule $Vm $CurrentHour $CurrentWeekDay $PatchStatus
+            $VmPowerAction = $Temp.PowerAction
+            Write-Verbose "$($Temp.logs)"                                                                                                                             #DEBUG OUTPUT
+            Write-Verbose "Checking WeeklySchedule... VmPowerAction: $VmPowerAction"
+        }
+        else {
+            $VmPowerAction = "KeepState"
+            Write-Output "$($Vm.Name): Patching not ongoing. No weekly schedule configured. Not changing power state"                                                 #INFORMATION OUTPUT
+        }
+    }
+    else {
+            $VmPowerAction = "KeepState"
+            Write-Error "PatchStatus variable does not contain a valid value. Please report this to an admin. The VM will not change state."                              #ERROR OUTPUT
+    }
+
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # Evaluate action provided by the weekly schedule 
+    #----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    Write-Verbose "$($Vm.Name): VM power action = $($VmPowerAction)"                                                                                                  #DEBUG OUTPUT
+    if ($VmPowerAction -eq "Start") {
+        if ($VmPowerState -eq "PowerState/running" -or $VmPowerState -eq "PowerState/starting") {
+            Write-Output "$($Vm.Name): CheckPowerState: VM already running`n"                                                                                        #DEBUG OUTPUT         
+        }
+        else {
+            $WORKFLOW:VmsToStart += $Vm
+            Write-Verbose "$($Vm.Name): Added to start list"                                                                                                              #DEBUG OUTPUT
+        }                                                                                                                      
+    }
+    elseif ($VmPowerAction -eq "Stop") {
+        if ($VmPowerState -eq "PowerState/deallocated" -or $VmPowerState -eq "PowerState/deallocating") {
+            Write-Output "$($Vm.Name): CheckPowerState: VM already stopped`n"                                                                                        #DEBUG OUTPUT         
+        }
+        else {
+            $WORKFLOW:VmsToStop += $Vm
+            Write-Verbose "$($Vm.Name): Added to stop list"                                                                                                              #DEBUG OUTPUT
+        }      
+    } 
+    elseif ($VmPowerAction -eq "NoEntry" -or $VmPowerAction -eq "KeepState") {
+        Write-Verbose "$($Vm.Name): Not changing power state"                                                                                                         #DEBUG OUTPUT
+    }
+    else {
+        Write-Error ("VmPowerAction variable does not contain a valid value. The value is: $VmPowerAction")                                                           #ERROR OUTPUT   
+    }
+}
+
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Evaluate start/stop lists and start/stop each VM
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+foreach -parallel -ThrottleLimit $VmsToStart.Count ($Vm in $VmsToStart) {         
+    if ($WhatIf) {
+        Write-Output "Whatif is enabled | Starting VM $($Vm.name)"                                                                   #INFORMATION OUTPUT
+    }
+    else {
+        Write-Output "Starting VM $($Vm.name)"                                                                                       #INFORMATION OUTPUT
+        Start-AzureRmVM -Name $Vm.name -ResourceGroupName $Vm.ResourceGroupName 
+    }
+}
+
+foreach -parallel -ThrottleLimit $VmsToStop.Count  ($Vm in $VmsToStop) {                                                                                                                    
+    if ($WhatIf) {
+        Write-Output "Whatif is enabled | Stopping VM $($Vm.name)"                                                                   #INFORMATION OUTPUT
+    }
+    else {    
+        Write-Output "Stopping VM $($vm.name)"                                                                                       #INFORMATION OUTPUT   
+        Stop-AzureRmVM -Name $Vm.name -ResourceGroupName $Vm.ResourceGroupName -Force
+    }
+}
+Write-Output "Runbook finished"     
+
+}
