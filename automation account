@@ -1,29 +1,38 @@
 name: ACEAD-AUTO-OTA-001
 Runbook: Check-VmSchedule-MSI
 
+SCHEDULES
+        HourlySchedule
+          Enabled
+          recuring
+          1 hours
+          expiration: NO
+        linked runbook: Check-VmSchedule-MSI
 
-  HourlySchedule
-    Enabled
-    recuring
-    1 hours
-    expiration: NO
-  linked runbook: Check-VmSchedule-MSI
-  
 
 
-SetPowerOnAfterMSI 
-  Enabled 
-    start: 6:30 
-    reccuring
-    every 1 day
-    expired:no
-  Linked ruunbook: Check-VmSchedule
-  
- 
- PowerOffAfterMSI
-  Enabled
-    reccuring
-    every 1 day
-  Linked runbook: Check-VmSchedule
-    
-    
+      SetPowerOnAfterMSI 
+        Enabled 
+          start: 6:30 
+          reccuring
+          every 1 day
+          expired:no
+        Linked ruunbook: Check-VmSchedule
+
+
+       PowerOffAfterMSI
+        Enabled
+          reccuring
+          every 1 day
+        Linked runbook: Check-VmSchedule
+        
+VARIABLES
+      name of the variable must be defined in "PatchSchedule" tag: 
+      Name: PatchSchedule-NonProd-2022
+      type: string
+      Value
+      {"1":["29","30"],"2":["1","2","22","23","26","27"],"3":["17","18","19","20","22","23"],"4":["30"],"5":["1","3","4","28","29","31"],"6":["1"],"7":["2","3","5","6"],"8":["27","28","30","31"],"9":["1"],"10":["29","30"],"11":["1","2","26","27","29","30"],"12":["31"]}
+      
+      
+      
+
