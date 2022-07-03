@@ -1,0 +1,29 @@
+name: ACEAD-AUTO-OTA-001
+Runbook: Check-VmSchedule-MSI
+
+
+  HourlySchedule
+    Enabled
+    recuring
+    1 hours
+    expiration: NO
+  linked runbook: Check-VmSchedule-MSI
+  
+
+
+SetPowerOnAfterMSI 
+  Enabled 
+    start: 6:30 
+    reccuring
+    every 1 day
+    expired:no
+  Linked ruunbook: Check-VmSchedule
+  
+ 
+ PowerOffAfterMSI
+  Enabled
+    reccuring
+    every 1 day
+  Linked runbook: Check-VmSchedule
+    
+    
